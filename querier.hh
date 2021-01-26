@@ -352,9 +352,6 @@ public:
         // The number of queriers evicted to free up resources to be able to
         // create new readers.
         uint64_t resource_based_evictions = 0;
-        // The number of queriers evicted to because the maximum memory usage
-        // was reached.
-        uint64_t memory_based_evictions = 0;
         // The number of queriers currently in the cache.
         uint64_t population = 0;
     };
@@ -418,10 +415,9 @@ private:
     index _shard_mutation_querier_index;
     std::chrono::seconds _entry_ttl;
     stats _stats;
-    size_t _max_queriers_memory_usage;
 
 public:
-    explicit querier_cache(size_t max_cache_size = 1'000'000, std::chrono::seconds entry_ttl = default_entry_ttl);
+    explicit querier_cache(std::chrono::seconds entry_ttl = default_entry_ttl);
 
     querier_cache(const querier_cache&) = delete;
     querier_cache& operator=(const querier_cache&) = delete;

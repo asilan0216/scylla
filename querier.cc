@@ -204,9 +204,8 @@ static querier_cache::entries::iterator find_querier(querier_cache::entries& ent
     return it->pos();
 }
 
-querier_cache::querier_cache(size_t max_cache_size, std::chrono::seconds entry_ttl)
-    : _entry_ttl(entry_ttl)
-    , _max_queriers_memory_usage(max_cache_size) {
+querier_cache::querier_cache(std::chrono::seconds entry_ttl)
+    : _entry_ttl(entry_ttl) {
 }
 
 class querier_inactive_read : public reader_concurrency_semaphore::inactive_read {
@@ -228,7 +227,6 @@ static void insert_querier(
         querier_cache::entries& entries,
         querier_cache::index& index,
         querier_cache::stats& stats,
-        size_t max_queriers_memory_usage,
         utils::UUID key,
         Querier&& q,
         std::chrono::seconds ttl,
@@ -244,27 +242,6 @@ static void insert_querier(
     ++stats.inserts;
 
     tracing::trace(trace_state, "Caching querier with key {}", key);
-
-    auto memory_usage = boost::accumulate(entries | boost::adaptors::transformed(
-                [] (const querier_cache::entry& e) { return e.value().memory_usage(); }), size_t(0));
-
-    // We add the memory-usage of the to-be added querier to the memory-usage
-    // of all the cached queriers. We now need to makes sure this number is
-    // smaller then the maximum allowed memory usage. If it isn't we evict
-    // cached queriers and substract their memory usage from this number until
-    // it goes below the limit.
-    memory_usage += q.memory_usage();
-
-    if (memory_usage >= max_queriers_memory_usage) {
-        auto it = entries.begin();
-        while (it != entries.end() && memory_usage >= max_queriers_memory_usage) {
-            memory_usage -= it->value().memory_usage();
-            it->value().permit().semaphore().unregister_inactive_read(std::move(*it).get_inactive_handle());
-            it = entries.erase(it);
-            --stats.population;
-            ++stats.memory_based_evictions;
-        }
-    }
 
     auto& sem = q.permit().semaphore();
 
@@ -293,15 +270,15 @@ static void insert_querier(
 }
 
 void querier_cache::insert(utils::UUID key, data_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _data_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), _entry_ttl, std::move(trace_state));
+    insert_querier(_entries, _data_querier_index, _stats, key, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 void querier_cache::insert(utils::UUID key, mutation_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _mutation_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), _entry_ttl, std::move(trace_state));
+    insert_querier(_entries, _mutation_querier_index, _stats, key, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 void querier_cache::insert(utils::UUID key, shard_mutation_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _shard_mutation_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), _entry_ttl, std::move(trace_state));
+    insert_querier(_entries, _shard_mutation_querier_index, _stats, key, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 template <typename Querier>
