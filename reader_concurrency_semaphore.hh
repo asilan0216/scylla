@@ -53,10 +53,17 @@ public:
 
     friend class reader_permit;
 
-    using eviction_notify_handler = noncopyable_function<void()>;
+    enum class evict_reason {
+        permit, // evicted due to permit shortage
+        time, // evicted due to expiring ttl
+        manual, // evicted manually via `try_evict_one_inactive_read()`
+    };
+
+    using eviction_notify_handler = noncopyable_function<void(evict_reason)>;
 
     class inactive_read {
         eviction_notify_handler _notify_handler;
+        std::optional<timer<lowres_clock>> _ttl_timer;
 
         friend class reader_concurrency_semaphore;
     public:
@@ -90,6 +97,8 @@ public:
     struct stats {
         // The number of inactive reads evicted to free up permits.
         uint64_t permit_based_evictions = 0;
+        // The number of inactive reads evicted due to expiring.
+        uint64_t time_based_evictions = 0;
         // The number of inactive reads currently registered.
         uint64_t inactive_reads = 0;
         // Total number of successful reads executed through this semaphore.
@@ -136,7 +145,7 @@ private:
     std::unique_ptr<permit_list> _permit_list;
 
 private:
-    inactive_reads_type::iterator evict(inactive_reads_type::iterator it);
+    inactive_reads_type::iterator evict(inactive_reads_type::iterator it, evict_reason reason);
 
     bool has_available_units(const resources& r) const;
 
@@ -185,6 +194,7 @@ public:
     /// The semaphore takes ownership of the created object and destroys it if
     /// it is evicted.
     inactive_read_handle register_inactive_read(std::unique_ptr<inactive_read> ir, eviction_notify_handler handler = {});
+    inactive_read_handle register_inactive_read(std::unique_ptr<inactive_read> ir, std::chrono::seconds ttl, eviction_notify_handler handler = {});
 
     /// Unregister the previously registered inactive read.
     ///

@@ -374,12 +374,23 @@ reader_concurrency_semaphore::~reader_concurrency_semaphore() {
 
 reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(std::unique_ptr<inactive_read> ir,
         eviction_notify_handler notify_handler) {
+    return register_inactive_read(std::move(ir), std::chrono::duration_values<std::chrono::seconds>::max(), std::move(notify_handler));
+}
+
+reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(std::unique_ptr<inactive_read> ir,
+        std::chrono::seconds ttl, eviction_notify_handler notify_handler) {
     // Implies _inactive_reads.empty(), we don't queue new readers before
     // evicting all inactive reads.
     if (_wait_list.empty()) {
         ir->_notify_handler = std::move(notify_handler);
         const auto [it, _] = _inactive_reads.emplace(_next_id++, std::move(ir));
         (void)_;
+        if (ttl != std::chrono::duration_values<std::chrono::seconds>::max()) {
+            ir->_ttl_timer.emplace([this, it = it] {
+                evict(it, evict_reason::time);
+            });
+            ir->_ttl_timer->arm(lowres_clock::now() + ttl);
+        }
         ++_stats.inactive_reads;
         return inactive_read_handle(*this, it->first);
     }
@@ -388,7 +399,7 @@ reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore:
     // admit some readers from the _wait_list.
     ir->evict();
     if (notify_handler) {
-        notify_handler();
+        notify_handler(evict_reason::permit);
     }
     ++_stats.permit_based_evictions;
     return inactive_read_handle();
@@ -419,17 +430,26 @@ bool reader_concurrency_semaphore::try_evict_one_inactive_read() {
     if (_inactive_reads.empty()) {
         return false;
     }
-    evict(_inactive_reads.begin());
+    evict(_inactive_reads.begin(), evict_reason::manual);
     return true;
 }
 
-reader_concurrency_semaphore::inactive_reads_type::iterator reader_concurrency_semaphore::evict(inactive_reads_type::iterator it) {
+reader_concurrency_semaphore::inactive_reads_type::iterator reader_concurrency_semaphore::evict(inactive_reads_type::iterator it, evict_reason reason) {
     auto ir = std::move(it->second);
     ir->evict();
     if (ir->_notify_handler) {
-        ir->_notify_handler();
+        ir->_notify_handler(reason);
     }
-    ++_stats.permit_based_evictions;
+    switch (reason) {
+        case evict_reason::permit:
+            ++_stats.permit_based_evictions;
+            break;
+        case evict_reason::time:
+            ++_stats.time_based_evictions;
+            break;
+        case evict_reason::manual:
+            break;
+    }
     --_stats.inactive_reads;
     return _inactive_reads.erase(it);
 }
@@ -459,7 +479,7 @@ future<reader_permit::resource_units> reader_concurrency_semaphore::do_wait_admi
     auto r = resources(1, static_cast<ssize_t>(memory));
     auto it = _inactive_reads.begin();
     while (!may_proceed(r) && it != _inactive_reads.end()) {
-        it = evict(it);
+        it = evict(it, evict_reason::permit);
     }
     if (may_proceed(r)) {
         permit.on_admission();

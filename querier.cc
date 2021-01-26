@@ -287,8 +287,17 @@ static void insert_querier(
     e.set_pos(--entries.end());
     ++stats.population;
 
-    auto notify_handler = [&stats] {
-        ++stats.resource_based_evictions;
+    auto notify_handler = [&stats] (reader_concurrency_semaphore::evict_reason reason) {
+        switch (reason) {
+            case reader_concurrency_semaphore::evict_reason::permit:
+                ++stats.resource_based_evictions;
+                break;
+            case reader_concurrency_semaphore::evict_reason::time:
+                // We are not using the ttl feature yet.
+                break;
+            case reader_concurrency_semaphore::evict_reason::manual:
+                break;
+        }
         --stats.population;
     };
 
