@@ -363,15 +363,13 @@ public:
         // Self reference so that we can remove the entry given an `entry&`.
         std::list<entry>::iterator _pos;
         const utils::UUID _key;
-        const lowres_clock::time_point _expires;
         std::unique_ptr<querier_base> _value;
         reader_concurrency_semaphore::inactive_read_handle _handle;
 
     public:
         template <typename Querier>
-        entry(utils::UUID key, Querier q, lowres_clock::time_point expires)
+        entry(utils::UUID key, Querier q)
             : _key(key)
-            , _expires(expires)
             , _value(std::make_unique<Querier>(std::move(q))) {
         }
 
@@ -393,10 +391,6 @@ public:
 
         const utils::UUID& key() const {
             return _key;
-        }
-
-        bool is_expired(const lowres_clock::time_point& now) const {
-            return _expires <= now;
         }
 
         const querier_base& value() const {
@@ -422,12 +416,9 @@ private:
     index _data_querier_index;
     index _mutation_querier_index;
     index _shard_mutation_querier_index;
-    timer<lowres_clock> _expiry_timer;
     std::chrono::seconds _entry_ttl;
     stats _stats;
     size_t _max_queriers_memory_usage;
-
-    void scan_cache_entries();
 
 public:
     explicit querier_cache(size_t max_cache_size = 1'000'000, std::chrono::seconds entry_ttl = default_entry_ttl);
@@ -482,6 +473,9 @@ public:
             const query::partition_slice& slice,
             tracing::trace_state_ptr trace_state);
 
+    /// Change the ttl of cache entries
+    ///
+    /// Applies only to entries inserted after the change.
     void set_entry_ttl(std::chrono::seconds entry_ttl);
 
     /// Evict a querier.

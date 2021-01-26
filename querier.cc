@@ -183,19 +183,6 @@ static can_use can_be_used_for_page(const Querier& q, const schema& s, const dht
 // The time-to-live of a cache-entry.
 const std::chrono::seconds querier_cache::default_entry_ttl{10};
 
-void querier_cache::scan_cache_entries() {
-    const auto now = lowres_clock::now();
-
-    auto it = _entries.begin();
-    const auto end = _entries.end();
-    while (it != end && it->is_expired(now)) {
-        ++_stats.time_based_evictions;
-        --_stats.population;
-        it->value().permit().semaphore().unregister_inactive_read(std::move(*it).get_inactive_handle());
-        it = _entries.erase(it);
-    }
-}
-
 static querier_cache::entries::iterator find_querier(querier_cache::entries& entries, querier_cache::index& index, utils::UUID key,
         dht::partition_ranges_view ranges, tracing::trace_state_ptr trace_state) {
     const auto queriers = index.equal_range(key);
@@ -218,10 +205,8 @@ static querier_cache::entries::iterator find_querier(querier_cache::entries& ent
 }
 
 querier_cache::querier_cache(size_t max_cache_size, std::chrono::seconds entry_ttl)
-    : _expiry_timer([this] { scan_cache_entries(); })
-    , _entry_ttl(entry_ttl)
+    : _entry_ttl(entry_ttl)
     , _max_queriers_memory_usage(max_cache_size) {
-    _expiry_timer.arm_periodic(entry_ttl / 2);
 }
 
 class querier_inactive_read : public reader_concurrency_semaphore::inactive_read {
@@ -246,7 +231,7 @@ static void insert_querier(
         size_t max_queriers_memory_usage,
         utils::UUID key,
         Querier&& q,
-        lowres_clock::time_point expires,
+        std::chrono::seconds ttl,
         tracing::trace_state_ptr trace_state) {
     // FIXME: see #3159
     // In reverse mode flat_mutation_reader drops any remaining rows of the
@@ -283,7 +268,7 @@ static void insert_querier(
 
     auto& sem = q.permit().semaphore();
 
-    auto& e = entries.emplace_back(key, std::move(q), expires);
+    auto& e = entries.emplace_back(key, std::move(q));
     e.set_pos(--entries.end());
     ++stats.population;
 
@@ -293,7 +278,7 @@ static void insert_querier(
                 ++stats.resource_based_evictions;
                 break;
             case reader_concurrency_semaphore::evict_reason::time:
-                // We are not using the ttl feature yet.
+                ++stats.time_based_evictions;
                 break;
             case reader_concurrency_semaphore::evict_reason::manual:
                 break;
@@ -301,25 +286,22 @@ static void insert_querier(
         --stats.population;
     };
 
-    if (auto irh = sem.register_inactive_read(std::make_unique<querier_inactive_read>(entries, e.pos()), std::move(notify_handler))) {
+    if (auto irh = sem.register_inactive_read(std::make_unique<querier_inactive_read>(entries, e.pos()), ttl, std::move(notify_handler))) {
         e.set_inactive_handle(std::move(irh));
         index.insert(e);
     }
 }
 
 void querier_cache::insert(utils::UUID key, data_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _data_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), lowres_clock::now() + _entry_ttl,
-            std::move(trace_state));
+    insert_querier(_entries, _data_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 void querier_cache::insert(utils::UUID key, mutation_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _mutation_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), lowres_clock::now() + _entry_ttl,
-            std::move(trace_state));
+    insert_querier(_entries, _mutation_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 void querier_cache::insert(utils::UUID key, shard_mutation_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _shard_mutation_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), lowres_clock::now() + _entry_ttl,
-            std::move(trace_state));
+    insert_querier(_entries, _shard_mutation_querier_index, _stats, _max_queriers_memory_usage, key, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 template <typename Querier>
@@ -386,7 +368,6 @@ std::optional<shard_mutation_querier> querier_cache::lookup_shard_mutation_queri
 
 void querier_cache::set_entry_ttl(std::chrono::seconds entry_ttl) {
     _entry_ttl = entry_ttl;
-    _expiry_timer.rearm(lowres_clock::now() + _entry_ttl / 2, _entry_ttl / 2);
 }
 
 bool querier_cache::evict_one() {
