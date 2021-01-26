@@ -183,25 +183,27 @@ static can_use can_be_used_for_page(const Querier& q, const schema& s, const dht
 // The time-to-live of a cache-entry.
 const std::chrono::seconds querier_cache::default_entry_ttl{10};
 
-static querier_cache::entries::iterator find_querier(querier_cache::entries& entries, querier_cache::index& index, utils::UUID key,
+static std::unique_ptr<querier_base> find_querier(querier_cache::index& index, utils::UUID key,
         dht::partition_ranges_view ranges, tracing::trace_state_ptr trace_state) {
     const auto queriers = index.equal_range(key);
 
     if (queriers.first == index.end()) {
         tracing::trace(trace_state, "Found no cached querier for key {}", key);
-        return entries.end();
+        return nullptr;
     }
 
-    const auto it = std::find_if(queriers.first, queriers.second, [&] (const querier_cache::entry& e) {
-        return ranges_match(e.value().schema(), e.value().ranges(), ranges);
+    const auto it = std::find_if(queriers.first, queriers.second, [&] (const querier_cache::index::value_type& e) {
+        return ranges_match(e.second->schema(), e.second->ranges(), ranges);
     });
 
     if (it == queriers.second) {
         tracing::trace(trace_state, "Found cached querier(s) for key {} but none matches the query range(s) {}", key, ranges);
-        return entries.end();
+        return nullptr;
     }
     tracing::trace(trace_state, "Found cached querier for key {} and range(s) {}", key, ranges);
-    return it->pos();
+    auto ptr = std::move(it->second);
+    index.erase(it);
+    return std::move(ptr);
 }
 
 querier_cache::querier_cache(std::chrono::seconds entry_ttl)
@@ -209,25 +211,40 @@ querier_cache::querier_cache(std::chrono::seconds entry_ttl)
 }
 
 class querier_inactive_read : public reader_concurrency_semaphore::inactive_read {
-    querier_cache::entries& _entries;
-    querier_cache::entries::iterator _pos;
+    flat_mutation_reader_opt _reader;
 
 public:
-    querier_inactive_read(querier_cache::entries& entries, querier_cache::entries::iterator pos)
-        : _entries(entries)
-        , _pos(pos) {
+    querier_inactive_read(flat_mutation_reader reader)
+        : _reader(std::move(reader)) {
     }
     virtual void evict() override {
-        _entries.erase(_pos);
+        _reader = {};
+    }
+    flat_mutation_reader reader() {
+        return std::move(*_reader);
+    }
+};
+
+struct querier_utils {
+    static flat_mutation_reader get_reader(querier_base& q) {
+        return std::move(std::get<flat_mutation_reader>(q._reader));
+    }
+    static reader_concurrency_semaphore::inactive_read_handle get_inactive_read_handle(querier_base& q) {
+        return std::move(std::get<reader_concurrency_semaphore::inactive_read_handle>(q._reader));
+    }
+    static void set_reader(querier_base& q, flat_mutation_reader r) {
+        q._reader = std::move(r);
+    }
+    static void set_inactive_read_handle(querier_base& q, reader_concurrency_semaphore::inactive_read_handle h) {
+        q._reader = std::move(h);
     }
 };
 
 template <typename Querier>
 static void insert_querier(
-        querier_cache::entries& entries,
+        utils::UUID key,
         querier_cache::index& index,
         querier_cache::stats& stats,
-        utils::UUID key,
         Querier&& q,
         std::chrono::seconds ttl,
         tracing::trace_state_ptr trace_state) {
@@ -245,11 +262,12 @@ static void insert_querier(
 
     auto& sem = q.permit().semaphore();
 
-    auto& e = entries.emplace_back(key, std::move(q));
-    e.set_pos(--entries.end());
+    auto it = index.emplace(key, std::make_unique<Querier>(std::move(q)));
+
     ++stats.population;
 
-    auto notify_handler = [&stats] (reader_concurrency_semaphore::evict_reason reason) {
+    auto notify_handler = [&stats, &index, it] (reader_concurrency_semaphore::evict_reason reason) {
+        index.erase(it);
         switch (reason) {
             case reader_concurrency_semaphore::evict_reason::permit:
                 ++stats.resource_based_evictions;
@@ -263,27 +281,25 @@ static void insert_querier(
         --stats.population;
     };
 
-    if (auto irh = sem.register_inactive_read(std::make_unique<querier_inactive_read>(entries, e.pos()), ttl, std::move(notify_handler))) {
-        e.set_inactive_handle(std::move(irh));
-        index.insert(e);
+    if (auto irh = sem.register_inactive_read(std::make_unique<querier_inactive_read>(querier_utils::get_reader(*it->second)), ttl, std::move(notify_handler))) {
+        querier_utils::set_inactive_read_handle(*it->second, std::move(irh));
     }
 }
 
 void querier_cache::insert(utils::UUID key, data_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _data_querier_index, _stats, key, std::move(q), _entry_ttl, std::move(trace_state));
+    insert_querier(key, _data_querier_index, _stats, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 void querier_cache::insert(utils::UUID key, mutation_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _mutation_querier_index, _stats, key, std::move(q), _entry_ttl, std::move(trace_state));
+    insert_querier(key, _mutation_querier_index, _stats, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 void querier_cache::insert(utils::UUID key, shard_mutation_querier&& q, tracing::trace_state_ptr trace_state) {
-    insert_querier(_entries, _shard_mutation_querier_index, _stats, key, std::move(q), _entry_ttl, std::move(trace_state));
+    insert_querier(key, _shard_mutation_querier_index, _stats, std::move(q), _entry_ttl, std::move(trace_state));
 }
 
 template <typename Querier>
 static std::optional<Querier> lookup_querier(
-        querier_cache::entries& entries,
         querier_cache::index& index,
         querier_cache::stats& stats,
         utils::UUID key,
@@ -291,20 +307,23 @@ static std::optional<Querier> lookup_querier(
         dht::partition_ranges_view ranges,
         const query::partition_slice& slice,
         tracing::trace_state_ptr trace_state) {
-    auto it = find_querier(entries, index, key, ranges, trace_state);
+    auto base_ptr = find_querier(index, key, ranges, trace_state);
     ++stats.lookups;
-    if (it == entries.end()) {
+    if (!base_ptr) {
         ++stats.misses;
         return std::nullopt;
     }
 
-    auto* q_ptr = dynamic_cast<Querier*>(&it->value());
+    auto* q_ptr = dynamic_cast<Querier*>(base_ptr.get());
     if (!q_ptr) {
         throw std::runtime_error("lookup_querier(): found querier is not of the expected type");
     }
-    auto q = std::move(*q_ptr);
-    q.permit().semaphore().unregister_inactive_read(std::move(*it).get_inactive_handle());
-    entries.erase(it);
+    auto& q = *q_ptr;
+    auto read_ptr = q.permit().semaphore().unregister_inactive_read(querier_utils::get_inactive_read_handle(q));
+    if (!read_ptr) {
+        throw std::runtime_error("lookup_querier(): found querier that is evicted");
+    }
+    querier_utils::set_reader(q, static_cast<querier_inactive_read*>(read_ptr.get())->reader());
     --stats.population;
 
     const auto can_be_used = can_be_used_for_page(q, s, ranges.front(), slice);
@@ -323,7 +342,7 @@ std::optional<data_querier> querier_cache::lookup_data_querier(utils::UUID key,
         const dht::partition_range& range,
         const query::partition_slice& slice,
         tracing::trace_state_ptr trace_state) {
-    return lookup_querier<data_querier>(_entries, _data_querier_index, _stats, key, s, range, slice, std::move(trace_state));
+    return lookup_querier<data_querier>(_data_querier_index, _stats, key, s, range, slice, std::move(trace_state));
 }
 
 std::optional<mutation_querier> querier_cache::lookup_mutation_querier(utils::UUID key,
@@ -331,7 +350,7 @@ std::optional<mutation_querier> querier_cache::lookup_mutation_querier(utils::UU
         const dht::partition_range& range,
         const query::partition_slice& slice,
         tracing::trace_state_ptr trace_state) {
-    return lookup_querier<mutation_querier>(_entries, _mutation_querier_index, _stats, key, s, range, slice, std::move(trace_state));
+    return lookup_querier<mutation_querier>(_mutation_querier_index, _stats, key, s, range, slice, std::move(trace_state));
 }
 
 std::optional<shard_mutation_querier> querier_cache::lookup_shard_mutation_querier(utils::UUID key,
@@ -339,7 +358,7 @@ std::optional<shard_mutation_querier> querier_cache::lookup_shard_mutation_queri
         const dht::partition_range_vector& ranges,
         const query::partition_slice& slice,
         tracing::trace_state_ptr trace_state) {
-    return lookup_querier<shard_mutation_querier>(_entries, _shard_mutation_querier_index, _stats, key, s, ranges, slice,
+    return lookup_querier<shard_mutation_querier>(_shard_mutation_querier_index, _stats, key, s, ranges, slice,
             std::move(trace_state));
 }
 
@@ -348,31 +367,37 @@ void querier_cache::set_entry_ttl(std::chrono::seconds entry_ttl) {
 }
 
 bool querier_cache::evict_one() {
-    if (_entries.empty()) {
-        return false;
-    }
+    auto maybe_evict_from_index = [this] (index& idx) -> bool {
+        if (idx.empty()) {
+            return false;
+        }
+        auto it = idx.begin();
+        it->second->permit().semaphore().unregister_inactive_read(querier_utils::get_inactive_read_handle(*it->second));
+        idx.erase(it);
+        ++_stats.resource_based_evictions;
+        --_stats.population;
+        return true;
+    };
 
-    ++_stats.resource_based_evictions;
-    --_stats.population;
-    auto& sem = _entries.front().value().permit().semaphore();
-    sem.unregister_inactive_read(std::move(_entries.front()).get_inactive_handle());
-    _entries.pop_front();
-
-    return true;
+    return maybe_evict_from_index(_data_querier_index) || maybe_evict_from_index(_mutation_querier_index) || maybe_evict_from_index(_shard_mutation_querier_index);
 }
 
 void querier_cache::evict_all_for_table(const utils::UUID& schema_id) {
-    auto it = _entries.begin();
-    const auto end = _entries.end();
-    while (it != end) {
-        if (it->value().schema().id() == schema_id) {
-            --_stats.population;
-            it->value().permit().semaphore().unregister_inactive_read(std::move(*it).get_inactive_handle());
-            it = _entries.erase(it);
-        } else {
-            ++it;
+    auto evict_from_index = [this, schema_id] (index& idx) {
+        for (auto it = idx.begin(); it != idx.end();) {
+            if (it->second->schema().id() == schema_id) {
+                it->second->permit().semaphore().unregister_inactive_read(querier_utils::get_inactive_read_handle(*it->second));
+                it = idx.erase(it);
+                --_stats.population;
+            } else {
+                ++it;
+            }
         }
-    }
+    };
+
+    evict_from_index(_data_querier_index);
+    evict_from_index(_mutation_querier_index);
+    evict_from_index(_shard_mutation_querier_index);
 }
 
 querier_cache_context::querier_cache_context(querier_cache& cache, utils::UUID key, query::is_first_page is_first_page)
