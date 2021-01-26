@@ -114,6 +114,8 @@ private:
         void operator()(entry& e) noexcept;
     };
 
+    using inactive_reads_type = std::map<uint64_t, std::unique_ptr<inactive_read>>;
+
 private:
     const resources _initial_resources;
     resources _resources;
@@ -124,11 +126,13 @@ private:
     size_t _max_queue_length = std::numeric_limits<size_t>::max();
     std::function<void()> _prethrow_action;
     uint64_t _next_id = 1;
-    std::map<uint64_t, std::unique_ptr<inactive_read>> _inactive_reads;
+    inactive_reads_type _inactive_reads;
     stats _stats;
     std::unique_ptr<permit_list> _permit_list;
 
 private:
+    inactive_reads_type::iterator evict(inactive_reads_type::iterator it);
+
     bool has_available_units(const resources& r) const;
 
     bool may_proceed(const resources& r) const;

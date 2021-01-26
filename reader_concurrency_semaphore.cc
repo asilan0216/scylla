@@ -414,14 +414,16 @@ bool reader_concurrency_semaphore::try_evict_one_inactive_read() {
     if (_inactive_reads.empty()) {
         return false;
     }
-    auto it = _inactive_reads.begin();
-    it->second->evict();
-    _inactive_reads.erase(it);
+    evict(_inactive_reads.begin());
+    return true;
+}
 
+reader_concurrency_semaphore::inactive_reads_type::iterator reader_concurrency_semaphore::evict(inactive_reads_type::iterator it) {
+    auto ir = std::move(it->second);
+    ir->evict();
     ++_stats.permit_based_evictions;
     --_stats.inactive_reads;
-
-    return true;
+    return _inactive_reads.erase(it);
 }
 
 bool reader_concurrency_semaphore::has_available_units(const resources& r) const {
@@ -449,12 +451,7 @@ future<reader_permit::resource_units> reader_concurrency_semaphore::do_wait_admi
     auto r = resources(1, static_cast<ssize_t>(memory));
     auto it = _inactive_reads.begin();
     while (!may_proceed(r) && it != _inactive_reads.end()) {
-        auto ir = std::move(it->second);
-        it = _inactive_reads.erase(it);
-        ir->evict();
-
-        ++_stats.permit_based_evictions;
-        --_stats.inactive_reads;
+        it = evict(it);
     }
     if (may_proceed(r)) {
         permit.on_admission();
