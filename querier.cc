@@ -227,18 +227,14 @@ querier_cache::querier_cache(size_t max_cache_size, std::chrono::seconds entry_t
 class querier_inactive_read : public reader_concurrency_semaphore::inactive_read {
     querier_cache::entries& _entries;
     querier_cache::entries::iterator _pos;
-    querier_cache::stats& _stats;
 
 public:
-    querier_inactive_read(querier_cache::entries& entries, querier_cache::entries::iterator pos, querier_cache::stats& stats)
+    querier_inactive_read(querier_cache::entries& entries, querier_cache::entries::iterator pos)
         : _entries(entries)
-        , _pos(pos)
-        , _stats(stats) {
+        , _pos(pos) {
     }
     virtual void evict() override {
         _entries.erase(_pos);
-        ++_stats.resource_based_evictions;
-        --_stats.population;
     }
 };
 
@@ -291,7 +287,12 @@ static void insert_querier(
     e.set_pos(--entries.end());
     ++stats.population;
 
-    if (auto irh = sem.register_inactive_read(std::make_unique<querier_inactive_read>(entries, e.pos(), stats))) {
+    auto notify_handler = [&stats] {
+        ++stats.resource_based_evictions;
+        --stats.population;
+    };
+
+    if (auto irh = sem.register_inactive_read(std::make_unique<querier_inactive_read>(entries, e.pos()), std::move(notify_handler))) {
         e.set_inactive_handle(std::move(irh));
         index.insert(e);
     }
