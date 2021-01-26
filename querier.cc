@@ -210,21 +210,6 @@ querier_cache::querier_cache(std::chrono::seconds entry_ttl)
     : _entry_ttl(entry_ttl) {
 }
 
-class querier_inactive_read : public reader_concurrency_semaphore::inactive_read {
-    flat_mutation_reader_opt _reader;
-
-public:
-    querier_inactive_read(flat_mutation_reader reader)
-        : _reader(std::move(reader)) {
-    }
-    virtual void evict() override {
-        _reader = {};
-    }
-    flat_mutation_reader reader() {
-        return std::move(*_reader);
-    }
-};
-
 struct querier_utils {
     static flat_mutation_reader get_reader(querier_base& q) {
         return std::move(std::get<flat_mutation_reader>(q._reader));
@@ -281,7 +266,7 @@ static void insert_querier(
         --stats.population;
     };
 
-    if (auto irh = sem.register_inactive_read(std::make_unique<querier_inactive_read>(querier_utils::get_reader(*it->second)), ttl, std::move(notify_handler))) {
+    if (auto irh = sem.register_inactive_read(querier_utils::get_reader(*it->second), ttl, std::move(notify_handler))) {
         querier_utils::set_inactive_read_handle(*it->second, std::move(irh));
     }
 }
@@ -323,7 +308,7 @@ static std::optional<Querier> lookup_querier(
     if (!read_ptr) {
         throw std::runtime_error("lookup_querier(): found querier that is evicted");
     }
-    querier_utils::set_reader(q, static_cast<querier_inactive_read*>(read_ptr.get())->reader());
+    querier_utils::set_reader(q, std::move(*read_ptr.get()));
     --stats.population;
 
     const auto can_be_used = can_be_used_for_page(q, s, ranges.front(), slice);

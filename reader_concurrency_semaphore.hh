@@ -27,6 +27,8 @@
 
 using namespace seastar;
 
+class flat_mutation_reader;
+
 /// Specific semaphore for controlling reader concurrency
 ///
 /// Use `make_permit()` to create a permit to track the resource consumption
@@ -60,16 +62,6 @@ public:
     };
 
     using eviction_notify_handler = noncopyable_function<void(evict_reason)>;
-
-    class inactive_read {
-        eviction_notify_handler _notify_handler;
-        std::optional<timer<lowres_clock>> _ttl_timer;
-
-        friend class reader_concurrency_semaphore;
-    public:
-        virtual void evict() = 0;
-        virtual ~inactive_read() = default;
-    };
 
     class inactive_read_handle {
         reader_concurrency_semaphore* _sem = nullptr;
@@ -128,7 +120,17 @@ private:
         void operator()(entry& e) noexcept;
     };
 
-    using inactive_reads_type = std::map<uint64_t, std::unique_ptr<inactive_read>>;
+    struct inactive_read {
+        std::unique_ptr<flat_mutation_reader> reader;
+        eviction_notify_handler notify_handler;
+        std::optional<timer<lowres_clock>> ttl_timer;
+
+        explicit inactive_read(flat_mutation_reader);
+        inactive_read(inactive_read&&) = default;
+        ~inactive_read();
+    };
+
+    using inactive_reads_type = std::map<uint64_t, inactive_read>;
 
 private:
     const resources _initial_resources;
@@ -193,14 +195,14 @@ public:
     /// interface.
     /// The semaphore takes ownership of the created object and destroys it if
     /// it is evicted.
-    inactive_read_handle register_inactive_read(std::unique_ptr<inactive_read> ir, eviction_notify_handler handler = {});
-    inactive_read_handle register_inactive_read(std::unique_ptr<inactive_read> ir, std::chrono::seconds ttl, eviction_notify_handler handler = {});
+    inactive_read_handle register_inactive_read(flat_mutation_reader ir, eviction_notify_handler handler = {});
+    inactive_read_handle register_inactive_read(flat_mutation_reader ir, std::chrono::seconds ttl, eviction_notify_handler handler = {});
 
     /// Unregister the previously registered inactive read.
     ///
     /// If the read was not evicted, the inactive read object, passed in to the
     /// register call, will be returned. Otherwise a nullptr is returned.
-    std::unique_ptr<inactive_read> unregister_inactive_read(inactive_read_handle irh);
+    std::unique_ptr<flat_mutation_reader> unregister_inactive_read(inactive_read_handle irh);
 
     /// Try to evict an inactive read.
     ///
