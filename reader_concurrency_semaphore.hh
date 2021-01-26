@@ -53,7 +53,12 @@ public:
 
     friend class reader_permit;
 
+    using eviction_notify_handler = noncopyable_function<void()>;
+
     class inactive_read {
+        eviction_notify_handler _notify_handler;
+
+        friend class reader_concurrency_semaphore;
     public:
         virtual void evict() = 0;
         virtual ~inactive_read() = default;
@@ -179,7 +184,7 @@ public:
     /// interface.
     /// The semaphore takes ownership of the created object and destroys it if
     /// it is evicted.
-    inactive_read_handle register_inactive_read(std::unique_ptr<inactive_read> ir);
+    inactive_read_handle register_inactive_read(std::unique_ptr<inactive_read> ir, eviction_notify_handler handler = {});
 
     /// Unregister the previously registered inactive read.
     ///

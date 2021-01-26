@@ -372,10 +372,12 @@ reader_concurrency_semaphore::~reader_concurrency_semaphore() {
     broken(std::make_exception_ptr(broken_semaphore{}));
 }
 
-reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(std::unique_ptr<inactive_read> ir) {
+reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore::register_inactive_read(std::unique_ptr<inactive_read> ir,
+        eviction_notify_handler notify_handler) {
     // Implies _inactive_reads.empty(), we don't queue new readers before
     // evicting all inactive reads.
     if (_wait_list.empty()) {
+        ir->_notify_handler = std::move(notify_handler);
         const auto [it, _] = _inactive_reads.emplace(_next_id++, std::move(ir));
         (void)_;
         ++_stats.inactive_reads;
@@ -385,6 +387,9 @@ reader_concurrency_semaphore::inactive_read_handle reader_concurrency_semaphore:
     // The evicted reader will release its permit, hopefully allowing us to
     // admit some readers from the _wait_list.
     ir->evict();
+    if (notify_handler) {
+        notify_handler();
+    }
     ++_stats.permit_based_evictions;
     return inactive_read_handle();
 }
@@ -421,6 +426,9 @@ bool reader_concurrency_semaphore::try_evict_one_inactive_read() {
 reader_concurrency_semaphore::inactive_reads_type::iterator reader_concurrency_semaphore::evict(inactive_reads_type::iterator it) {
     auto ir = std::move(it->second);
     ir->evict();
+    if (ir->_notify_handler) {
+        ir->_notify_handler();
+    }
     ++_stats.permit_based_evictions;
     --_stats.inactive_reads;
     return _inactive_reads.erase(it);
